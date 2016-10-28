@@ -2,6 +2,9 @@
 
 abspath="$(cd "${0%/*}" 2>/dev/null; echo "$PWD"/"${0##*/}")"
 root_dir=`dirname "$abspath"`
+app_name=learnjs
+code_bucket=${app_name}/_code_bundles
+profile=admin
 
 function check_python() {
   if ! which python > /dev/null; then
@@ -13,6 +16,10 @@ function check_python() {
 function check_aws() {
   if ! which aws > /dev/null; then
     echo "Can't find AWS CLI. Install 'awscli' using pip."
+    exit 1
+  fi
+  if ! aws configure list --profile $profile > /dev/null; then
+    echo "Run \`aws configure --profile $profile\` to create it"
     exit 1
   fi
 }
@@ -27,24 +34,43 @@ function check_node_deps() {
 function dev_server() {
   cd public
   exec python -m SimpleHTTPServer 9292
-  popd
+}
+
+function livereload_server() {
+  cd public
+  exec livereloadx -s -p 9292 "$PWD"
 }
 
 function create_s3_bucket() {
   local bucket_name=$1
   local bucket_uri="s3://${bucket_name}"
-  aws s3 mb $bucket_uri
-  aws s3 website \
+  local bucket_path=conf/s3/${bucket_name}
+  # The s3 command doesn't output JSON :-/
+  if [[ ! -e ${bucket_path}/endpoint.txt ]]; then
+    aws --profile $profile s3 mb $bucket_uri && mkdir -p ${bucket_path}
+    local region=$(aws --profile $profile configure get region)
+    local endpoint="http://${1}.s3-website-${region}.amazonaws.com"
+    echo "$endpoint" > ${bucket_path}/endpoint.txt
+    echo "Website endpoint is: $endpoint"
+  fi
+}
+
+function webify_bucket() {
+  local bucket_name=$1
+  local bucket_uri="s3://${bucket_name}"
+  aws --profile $profile s3 website \
     --index-document index.html \
     --error-document error.html \
     $bucket_uri
-  local region=$(aws configure get region)
-  echo "Website endpoint is: http://${1}.s3-website-${region}.amazonaws.com"
 }
 
 function deploy_s3_bucket() {
-  local bucket_uri="s3://$1"
-  aws s3 sync public/ $bucket_uri --acl public-read
+  local bucket_name=$1
+  if [[ -d ${1} ]]; then
+    bucket_name=$(basename $bucket_name)
+  fi
+  local bucket_uri="s3://${1}"
+  aws --profile $profile s3 sync public/ $bucket_uri --acl public-read
 }
 
 function generate_assume_role_policy() {
@@ -108,7 +134,8 @@ function create_cognito_auth_role() {
   if [[ ! -s ${identity_pool_dir}/role_info.json ]]; then
     local role_name="${pool_name}_cognito_authenticated"
     echo "Creaing role: $role_name"
-    aws iam create-role \
+    # Might be able to use the create_iam_role function for this
+    aws --profile $profile iam create-role \
       --role-name "$role_name" \
       --assume-role-policy-document "file://${identity_pool_dir}/assume_role_policy.json" \
       > ${identity_pool_dir}/role_info.json
@@ -126,7 +153,7 @@ function create_identity_pool() {
   local identity_pool_name=$(basename $identity_pool_dir)
   if [[ ! -s ${identity_pool_dir}/pool_info.json ]]; then
     echo "Creating identity pool: $identity_pool_name"
-    aws cognito-identity create-identity-pool \
+    aws --profile $profile cognito-identity create-identity-pool \
       --identity-pool-name $identity_pool_name \
       --cli-input-json "file://${identity_pool_dir}/config.json" \
       > ${identity_pool_dir}/pool_info.json
@@ -136,7 +163,7 @@ function create_identity_pool() {
   local pool_id=$(support/jsed.py ${identity_pool_dir}/pool_info.json 'IdentityPoolId')
   local role_arn=$(support/jsed.py ${identity_pool_dir}/role_info.json 'Role.Arn')
   echo "Updating identity pool roles"
-  aws cognito-identity set-identity-pool-roles \
+  aws --profile $profile cognito-identity set-identity-pool-roles \
     --identity-pool-id ${pool_id} \
     --roles authenticated=${role_arn}
 }
@@ -146,15 +173,23 @@ function create_table() {
   local table_name=$(basename $table_dir)
   local role_name="${2}_cognito_authenticated"
   if [[ ! -s ${table_dir}/table_info.json ]]; then
-    aws dynamodb create-table \
+    aws --profile $profile dynamodb create-table \
       --table-name $table_name \
       --cli-input-json "file://${table_dir}/config.json" \
       > ${table_dir}/table_info.json
+
+    echo -n "Waiting for table creation..."
+    aws --profile $profile dynamodb describe-table --table-name "$table_name" > ${table_dir}/table_info.json
+    while [[ "$(support/jsed.py ${table_dir}/table_info.json 'Table.TableStatus')" != "ACTIVE" ]]; do
+      aws --profile $profile dynamodb describe-table --table-name "$table_name" > ${table_dir}/table_info.json
+      echo -n .
+    done
+    echo "...done!"
   fi
 
-  local table_arn=$(support/jsed.py ${table_dir}/table_info.json 'TableDescription.TableArn')
+  local table_arn=$(support/jsed.py ${table_dir}/table_info.json 'Table.TableArn')
   generate_table_policy ${table_arn} > ${table_dir}/role_policy.json
-  aws iam put-role-policy \
+  aws --profile $profile iam put-role-policy \
     --policy-document file://${table_dir}/role_policy.json \
     --role-name ${role_name} \
     --policy-name ${table_name}_table_access
@@ -168,15 +203,21 @@ function build_bundle() {
   mkdir -p dist
   cp -r node_modules dist/
   cp -r lib/* dist/
-  zip -r archive.zip dist/*
+  cd dist
+  chmod -R a+r *
+  zip -r archive.zip *
+  mv archive.zip ..
+  cd ..
   rm -rf dist
   popd
 }
 
 function deploy_bundle {
-  pushd services
-  node ./lib/deploy.js prod
-  popd
+  for fn in `ls conf/lambda/functions`; do
+    aws --profile $profile lambda update-function-code \
+      --function-name $fn \
+      --zip-file "fileb://services/archive.zip" > conf/lambda/functions/$fn/info.json
+  done
 }
 
 function test_services() {
@@ -190,33 +231,61 @@ function test_services() {
   cd ..
 }
 
+function create_iam_role() {
+  local role_name="${app_name}_lambda_exec"
+  local role_dir=conf/iam/roles/${role_name}
+  local policy_document=$2
+  mkdir -p $role_dir
+  if [[ ! -e ${role_dir}/info.json ]]; then
+    aws --profile $profile iam create-role \
+      --role-name "$role_name" \
+      --assume-role-policy-document "${policy_document}" \
+      > ${role_dir}/info.json
+  fi
+}
+
+function create_lambda_service() {
+  local service_dir=${1%/}
+  local function_name=$(basename $service_dir)
+  create_iam_role lambda_exec "file://conf/iam/policies/lambda_trust.json"
+  echo -n "Waiting for IAM Role to become available..."
+  local role_arn=$(support/jsed.py conf/iam/roles/${app_name}_lambda_exec/info.json 'Role.Arn')
+  while ! aws --profile $profile iam get-role --role-name ${app_name}_lambda_exec &> /dev/null; do
+    echo -n .
+  done
+  sleep 5 # See issue #17
+  echo "...done!"
+  if [[ ! -e ${service_dir}/info.json ]]; then
+    aws --profile $profile lambda create-function \
+      --function-name ${function_name} \
+      --role ${role_arn} \
+      --zip-file "fileb://services/archive.zip" \
+      --handler "index.${function_name}" \
+      --cli-input-json "file://${service_dir}/config.json" \
+      > ${service_dir}/info.json
+  fi
+}
+
 function help() {
   echo "#################################################"
   echo "# Serverless Single Page Apps - The Bash Helper #"
   echo "#################################################"
-  echo 
-  echo "Usage: sspa <action> [argument]"
-  echo 
+  echo
+  echo "Usage: sspa <action> [arguments...]"
+  echo
   echo "Where <action> is one of:"
-  echo "    server                                 - Run a local development server"
-  echo "    create_bucket <bucket name>            - Create a web-accessible bucket in S3"
-  echo "    deploy_bucket <bucket name>            - Deploy the application to S3 bucket"
-  echo "    create_pool <config dir>               - Create a new Cognito identity pool"
-  echo "    create_table <config dir> <pool_name>  - Create a new DynamoDB table"
-  echo "    test                                   - Run Lambda service automated tests"
-  echo "    build_bundle                           - Build the Lambda service bundle"
-  echo "    deploy_bundle                          - Deploy the Lambda service bundle"
-  echo 
-  echo "Examples:"
-  echo 
-  echo "Deploy the web app to an S3 bucket:" 
-  echo " $ sspa deploy_public learnjs.benrady.com"
-  echo 
-  echo "Create the 'learnjs' identity pool" 
-  echo " $ sspa create_pool conf/cognito/identity_pools/learnjs"
-  echo 
-  echo "Create a 'learnjs' table accessible by users in the 'learnjs' identity pool" 
-  echo " $ sspa create_pool conf/cognito/identity_pools/learnjs learnjs"
+  echo "    server"
+  echo "    liveserver"
+  echo "    create_bucket <bucket name>"
+  echo "    deploy_bucket <bucket name>"
+  echo "    create_pool <config dir>"
+  echo "    create_table <config dir> <pool name>"
+  echo "    test"
+  echo "    build_bundle"
+  echo "    deploy_bundle"
+  echo "    create_service <config file>"
+  #echo "    create_gateway <config_file> <service> - Attach an API Gateway to a service"
+  echo
 }
 
 action=${1:-"help"}
@@ -226,6 +295,10 @@ cd "$root_dir"
 check_python
 
 case "$action" in
+  liveserver)
+    livereload_server
+    ;;
+
   server)
     dev_server
     ;;
@@ -239,13 +312,16 @@ case "$action" in
     ;;
 
   deploy_bundle)
+    check_aws
     build_bundle
     deploy_bundle
     ;;
 
   create_bucket)
+    check_aws
     if [[ $# -eq 2 ]]; then
       create_s3_bucket ${2}
+      webify_bucket ${2}
     else
       echo "Please specify a bucket name"
       exit 1
@@ -253,6 +329,7 @@ case "$action" in
     ;;
 
   deploy_bucket)
+    check_aws
     if [[ $# -eq 2 ]]; then
       deploy_s3_bucket ${2}
     else
@@ -262,19 +339,32 @@ case "$action" in
     ;;
 
   create_pool)
+    check_aws
     if [[ $# -eq 2 ]]; then
       create_identity_pool ${2}
     else
-      echo "Please specify a Cognito identity pool configuration directory" 
+      echo "Please specify a Cognito identity pool configuration directory"
       exit 1
     fi
     ;;
 
   create_table)
+    check_aws
     if [[ $# -eq 3 ]]; then
       create_table ${2} ${3}
     else
-      echo "Please specify a DynamoDB table configuration directory and identity pool name" 
+      echo "Please specify a DynamoDB table configuration directory and identity pool name"
+      exit 1
+    fi
+    ;;
+
+  create_service)
+    check_aws
+    if [[ $# -eq 2 ]]; then
+      build_bundle
+      create_lambda_service ${2}
+    else
+      echo "Please specify a Lambda config directory"
       exit 1
     fi
     ;;

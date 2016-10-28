@@ -1,4 +1,16 @@
 
+## Change Log
+
+### Beta 3 Changes
+
+  * Compensating for AWSCLI timing issues when creating roles
+
+### Beta 2 Changes
+
+  * Now using 'admin' profile instead of default profile
+  * Added create_service action to sspa
+  * deploy_bucket can now take a config path
+
 ## MIT License
 
 Note: The license below applies only to the contents of this git repository, not the Pragmatic Bookshelf title "Serverless Single Page Apps", or any other related content.
