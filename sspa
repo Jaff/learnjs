@@ -293,6 +293,7 @@ action=${1:-"help"}
 cd "$root_dir"
 
 check_python
+check_aws
 
 case "$action" in
   liveserver)
@@ -365,6 +366,16 @@ case "$action" in
       create_lambda_service ${2}
     else
       echo "Please specify a Lambda config directory"
+      exit 1
+    fi
+    ;;
+
+  create_service)
+    if [[ $# -eq 2 ]]; then
+      build_bundle
+      create_lambda_service ${2}
+    else
+      echo "Please specify a Lambda config directory" 
       exit 1
     fi
     ;;
